@@ -70,16 +70,19 @@ jobs:
           echo "tag=$tag" >>"$GITHUB_OUTPUT"
           echo "build=$build" >>"$GITHUB_OUTPUT"
 
-  # Checks that the feature patch still applies to the new release; if not, an agent refits it.
+  # An agent checks every new upstream release against the patch and the rename step, and refits them when needed.
   patch:
     needs: plan
     if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: write
     outputs:
       ref: ${{ steps.ref.outputs.ref }}
+      report: ${{ steps.verify.outputs.report }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - name: Check out upstream at the release tag
         uses: actions/checkout@v6
@@ -94,6 +97,19 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           path: .plus
 
+      - name: Find the previous Orca Plus release
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          previous="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          if [[ -n "$previous" && "$previous" != "$TAG" ]]; then
+            git fetch --no-tags --depth=1 origin "refs/tags/$previous:refs/tags/$previous"
+            echo "tag=$previous" >>"$GITHUB_OUTPUT"
+            echo "Upstream since $previous: $(git diff --shortstat "$previous" "$TAG")"
+          fi
+
       - name: Make up a conflict
         if: inputs.simulate_conflict
         run: |
@@ -104,22 +120,33 @@ jobs:
 
       - name: Try the patch
         id: apply
+        env:
+          PREVIOUS: ${{ steps.previous.outputs.tag }}
         run: |
+          set -euo pipefail
+          clean=true
           if git apply --check "$PATCH"; then
-            echo "clean=true" >>"$GITHUB_OUTPUT"
+            git apply "$PATCH"
           else
-            echo "clean=false" >>"$GITHUB_OUTPUT"
-            echo "::warning::The patch does not apply to ${{ needs.plan.outputs.tag }}; handing it to the agent."
+            clean=false
+            echo "::warning::The patch does not apply to $TAG; the agent refits it."
           fi
+          # The agent runs on a conflict, and on every release that has a previous one to compare with.
+          agent=false
+          if [[ "$clean" == false || -n "$PREVIOUS" ]]; then
+            agent=true
+          fi
+          echo "clean=$clean" >>"$GITHUB_OUTPUT"
+          echo "agent=$agent" >>"$GITHUB_OUTPUT"
 
       - name: Setup pnpm
-        if: steps.apply.outputs.clean == 'false'
+        if: steps.apply.outputs.agent == 'true'
         uses: pnpm/setup@v2
         with:
           install: false
 
       - name: Setup Node.js
-        if: steps.apply.outputs.clean == 'false'
+        if: steps.apply.outputs.agent == 'true'
         uses: actions/setup-node@v6
         with:
           node-version-file: package.json
@@ -127,61 +154,84 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Install dependencies
-        if: steps.apply.outputs.clean == 'false'
+        if: steps.apply.outputs.agent == 'true'
         run: pnpm install --frozen-lockfile
 
-      - name: Refit the patch
-        if: steps.apply.outputs.clean == 'false'
+      - name: Adapt Orca Plus to the release
+        if: steps.apply.outputs.agent == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
           prompt: |
-            This checkout is upstream Orca at release ${{ needs.plan.outputs.tag }}. The Orca Plus feature patch
-            `${{ env.PATCH }}` no longer applies to it.
+            This checkout is upstream Orca (`stablyai/orca`) at release ${{ needs.plan.outputs.tag }}. Orca Plus builds it
+            with one feature patch and a rename step. Read `.plus/plus/AGENT.md` first: it describes both,
+            what to review on a new release, the rules, and the report you must write.
 
-            Read `.plus/plus/AGENT.md` first: it says what the patch does and the rules for repairing it.
+            State of this checkout:
+            - Feature patch `${{ env.PATCH }}`: ${{ steps.apply.outputs.clean == 'true' && 'applies cleanly and is already applied to the working tree, uncommitted.' || 'does NOT apply. Start with `git apply --3way` on it and resolve what it leaves.' }}
+            - Previous Orca Plus release: ${{ steps.previous.outputs.tag && format('{0}. That tag is fetched, so `git diff {0} {1} -- <path>` shows what upstream changed since the last build.', steps.previous.outputs.tag, needs.plan.outputs.tag) || 'none to compare with; only the patch needs work.' }}
 
-            Then make the working tree carry the same feature on this release. Start with
-            `git apply --3way ${{ env.PATCH }}`, resolve what it leaves, and fix whatever upstream
-            changed around the patch. Leave the result as uncommitted changes under `src/`: the workflow
-            turns them into the new patch itself. Do not commit, push, or open a pull request.
-
-            Finish only when `pnpm run typecheck` and `pnpm exec vitest run ${{ env.PINNED_TEST }}` pass.
-            End with a short summary of what conflicted and how you resolved it.
+            Make Orca Plus work on this release as `AGENT.md` describes, changing only what this release
+            requires. Then write the report to `plus-report.md` in the repository root.
+            Do not commit, push, or open a pull request: the workflow verifies and saves your changes.
           claude_args: |
-            --max-turns 120
+            --model opus
+            --effort xhigh
+            --max-turns 250
             --permission-mode acceptEdits
-            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git apply:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git checkout:*),Bash(git add:*),Bash(git restore:*),Bash(pnpm run typecheck),Bash(pnpm exec vitest run:*),Bash(pnpm exec prettier:*),Bash(pnpm exec oxlint:*),Bash(ls:*),Bash(cat:*),Bash(sed:*),Bash(rg:*),Bash(grep:*)"
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git apply:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(git checkout:*),Bash(git add:*),Bash(git restore:*),Bash(pnpm run typecheck),Bash(pnpm exec vitest run:*),Bash(pnpm exec prettier:*),Bash(pnpm exec oxlint:*),Bash(node --check:*),Bash(ls:*),Bash(cat:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(sed -n:*),Bash(rg:*),Bash(grep:*)"
 
-      - name: Verify the refitted patch
-        if: steps.apply.outputs.clean == 'false'
+      - name: Verify the agent's work
+        id: verify
+        if: steps.apply.outputs.agent == 'true'
         run: |
           set -euo pipefail
-          git add -A -- src
-          git diff --cached --binary HEAD -- src >"$RUNNER_TEMP/refit.patch"
-          if [[ ! -s "$RUNNER_TEMP/refit.patch" ]]; then
-            echo "::error::The agent left no changes under src/."
+          if [[ ! -s plus-report.md ]]; then
+            echo "::error::The agent wrote no plus-report.md."
             exit 1
           fi
+          cat plus-report.md >>"$GITHUB_STEP_SUMMARY"
+          if grep -qi '^Verdict: *blocked' plus-report.md; then
+            echo "::error::The agent says this release needs a human. See the run summary."
+            exit 1
+          fi
+
+          # The agent may change the tooling under plus/ and nothing else in this repository.
+          git -C .plus checkout -- .github README.md
+
+          git add -A -- src
+          git diff --cached --binary HEAD -- src >"$RUNNER_TEMP/refit.patch"
           grep -q ORCA_CLAUDE_PINNED_ACCOUNT "$RUNNER_TEMP/refit.patch"
           grep -q 'claude-account:' "$RUNNER_TEMP/refit.patch"
           pnpm run typecheck
           pnpm exec vitest run "$PINNED_TEST"
-          echo "Refitted patch: $(grep -c '^diff --git' "$RUNNER_TEMP/refit.patch") files"
 
-      - name: Save the refitted patch
-        if: steps.apply.outputs.clean == 'false' && !inputs.simulate_conflict
-        env:
-          TAG: ${{ needs.plan.outputs.tag }}
+          # The rename step has its own guards; run it here so a miss stops the release before the macOS build.
+          cp -R .plus/plus plus
+          node plus/rebrand.mjs
+
+          {
+            echo 'report<<PLUS_REPORT_END'
+            cat plus-report.md
+            echo
+            echo 'PLUS_REPORT_END'
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Save the agent's changes
+        if: steps.apply.outputs.agent == 'true' && !inputs.simulate_conflict
         run: |
           set -euo pipefail
           cp "$RUNNER_TEMP/refit.patch" "$PATCH"
           cd .plus
+          if [[ -z "$(git status --porcelain -- plus)" ]]; then
+            echo "Nothing to save."
+            exit 0
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add plus/patches
-          git commit -m "Refit the patch to upstream $TAG"
+          git add plus
+          git commit -m "Adapt Orca Plus to upstream $TAG"
           git push origin "HEAD:${{ github.event.repository.default_branch }}"
 
       - name: Record the tooling commit
@@ -323,13 +373,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PLUS_SHA: ${{ needs.patch.outputs.ref }}
+          REPORT: ${{ needs.patch.outputs.report }}
         run: |
           set -euo pipefail
+          {
+            echo "Orca $TAG from $UPSTREAM_REPO with the Orca Plus patch. Apple silicon only."
+            if [[ -n "$REPORT" ]]; then
+              printf '\n## Adaptation report\n\n%s\n' "$REPORT"
+            fi
+          } >"$RUNNER_TEMP/notes.md"
           assets=(dist/orca-plus-arm64.dmg dist/orca-plus-arm64.zip dist/*.blockmap dist/latest-mac.yml)
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$PLUS_SHA" --latest \
-              --title "Orca Plus ${TAG#v}" \
-              --notes "Orca $TAG from $UPSTREAM_REPO with the Orca Plus patch. Apple silicon only."
+              --title "Orca Plus ${TAG#v}" --notes-file "$RUNNER_TEMP/notes.md"
           fi
