@@ -367,7 +367,11 @@ jobs:
           xcrun stapler validate "$app"
           spctl --assess --type execute -vv "$app"
           test "v$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$TAG"
-          ! grep -R -a -q 'github.com/stablyai/orca/releases/latest/download' "$app/Contents/Resources/app.asar"
+          # The updater must read this repository's releases, never upstream's.
+          resources="$app/Contents/Resources"
+          ! grep -R -a -q 'stablyai/orca/releases/latest/download' "$resources/app.asar" "$resources/app.asar.unpacked/out/main"
+          grep -R -a -q "$GITHUB_REPOSITORY/releases/latest/download" "$resources/app.asar" "$resources/app.asar.unpacked/out/main"
+          grep -R -a -q 'ORCA_CLAUDE_PINNED_ACCOUNT' "$resources/app.asar.unpacked/out"
 
       - name: Publish the release
         env:
