@@ -1,0 +1,335 @@
+name: Orca Plus release
+
+run-name: Orca Plus ${{ inputs.tag || 'latest upstream release' }}${{ inputs.simulate_conflict && ' (agent rehearsal)' || '' }}
+
+on:
+  schedule:
+    - cron: '23 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream release tag to build, for example v1.4.278. Empty takes the latest stable release.
+        required: false
+        type: string
+      rebuild:
+        description: Build even if this repository already has a release for the tag
+        required: false
+        default: false
+        type: boolean
+      simulate_conflict:
+        description: Rehearse the repair agent on a made-up conflict. Nothing is committed, built or released.
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plus-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: stablyai/orca
+  PATCH: .plus/plus/patches/0001-claude-account-launch.patch
+  PINNED_TEST: src/main/claude-accounts/profiles/routing/claude-profile-router-pinned.test.ts
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - name: Pick the upstream release to build
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REBUILD: ${{ inputs.rebuild }}
+          SIMULATE: ${{ inputs.simulate_conflict }}
+          HAS_SIGNING_SECRETS: ${{ secrets.MAC_CERTS != '' && secrets.MAC_CERTS_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$tag is not a stable release tag"
+            exit 1
+          fi
+          build=true
+          if [[ "$SIMULATE" == true ]]; then
+            echo "::notice::Agent rehearsal on $tag"
+          elif [[ "$HAS_SIGNING_SECRETS" != true ]]; then
+            echo "::notice::Signing secrets are not set yet; nothing to build."
+            build=false
+          elif [[ "$REBUILD" != true ]] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::$tag is already released here."
+            build=false
+          fi
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "build=$build" >>"$GITHUB_OUTPUT"
+
+  # Checks that the feature patch still applies to the new release; if not, an agent refits it.
+  patch:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - name: Check out upstream at the release tag
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+
+      - name: Check out the Orca Plus tooling
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .plus
+
+      - name: Make up a conflict
+        if: inputs.simulate_conflict
+        run: |
+          set -euo pipefail
+          file=src/main/claude-accounts/profiles/routing/claude-profile-router.ts
+          perl -0pi -e 's/(\n  terminalEnv\()/\n  \/\/ A line upstream added right where the patch lands.$1/' "$file"
+          git -c user.name=rehearsal -c user.email=rehearsal@example.invalid commit -qam 'Made-up upstream change'
+
+      - name: Try the patch
+        id: apply
+        run: |
+          if git apply --check "$PATCH"; then
+            echo "clean=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >>"$GITHUB_OUTPUT"
+            echo "::warning::The patch does not apply to ${{ needs.plan.outputs.tag }}; handing it to the agent."
+          fi
+
+      - name: Setup pnpm
+        if: steps.apply.outputs.clean == 'false'
+        uses: pnpm/setup@v2
+        with:
+          install: false
+
+      - name: Setup Node.js
+        if: steps.apply.outputs.clean == 'false'
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        if: steps.apply.outputs.clean == 'false'
+        run: pnpm install --frozen-lockfile
+
+      - name: Refit the patch
+        if: steps.apply.outputs.clean == 'false'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            This checkout is upstream Orca at release ${{ needs.plan.outputs.tag }}. The Orca Plus feature patch
+            `${{ env.PATCH }}` no longer applies to it.
+
+            Read `.plus/plus/AGENT.md` first: it says what the patch does and the rules for repairing it.
+
+            Then make the working tree carry the same feature on this release. Start with
+            `git apply --3way ${{ env.PATCH }}`, resolve what it leaves, and fix whatever upstream
+            changed around the patch. Leave the result as uncommitted changes under `src/`: the workflow
+            turns them into the new patch itself. Do not commit, push, or open a pull request.
+
+            Finish only when `pnpm run typecheck` and `pnpm exec vitest run ${{ env.PINNED_TEST }}` pass.
+            End with a short summary of what conflicted and how you resolved it.
+          claude_args: |
+            --max-turns 120
+            --permission-mode acceptEdits
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git apply:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git checkout:*),Bash(git add:*),Bash(git restore:*),Bash(pnpm run typecheck),Bash(pnpm exec vitest run:*),Bash(pnpm exec prettier:*),Bash(pnpm exec oxlint:*),Bash(ls:*),Bash(cat:*),Bash(sed:*),Bash(rg:*),Bash(grep:*)"
+
+      - name: Verify the refitted patch
+        if: steps.apply.outputs.clean == 'false'
+        run: |
+          set -euo pipefail
+          git add -A -- src
+          git diff --cached --binary HEAD -- src >"$RUNNER_TEMP/refit.patch"
+          if [[ ! -s "$RUNNER_TEMP/refit.patch" ]]; then
+            echo "::error::The agent left no changes under src/."
+            exit 1
+          fi
+          grep -q ORCA_CLAUDE_PINNED_ACCOUNT "$RUNNER_TEMP/refit.patch"
+          grep -q 'claude-account:' "$RUNNER_TEMP/refit.patch"
+          pnpm run typecheck
+          pnpm exec vitest run "$PINNED_TEST"
+          echo "Refitted patch: $(grep -c '^diff --git' "$RUNNER_TEMP/refit.patch") files"
+
+      - name: Save the refitted patch
+        if: steps.apply.outputs.clean == 'false' && !inputs.simulate_conflict
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/refit.patch" "$PATCH"
+          cd .plus
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add plus/patches
+          git commit -m "Refit the patch to upstream $TAG"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+
+      - name: Record the tooling commit
+        id: ref
+        run: echo "ref=$(git -C .plus rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: [plan, patch]
+    if: needs.plan.outputs.build == 'true' && !inputs.simulate_conflict
+    # GitHub-hosted Apple silicon; upstream builds on a paid Blacksmith runner.
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      ORCA_BACKGROUND_LAUNCH: '1'
+      NODE_OPTIONS: --max-old-space-size=4096
+      ORCA_PLUS_RELEASE_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out upstream at the release tag
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+
+      - name: Check out the Orca Plus tooling
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.patch.outputs.ref }}
+          path: .plus
+          persist-credentials: false
+
+      - name: Apply the feature patch
+        run: |
+          set -euo pipefail
+          git apply --index "$PATCH"
+          cp -R .plus/plus plus
+          rm -rf .plus
+          git status --short
+
+      - name: Setup pnpm
+        uses: pnpm/setup@v2
+        with:
+          install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          check-latest: true
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            mobile/pnpm-lock.yaml
+
+      - name: Locate the pinned Node runtime cache
+        run: echo "ORCA_NODE_RUNTIME_CACHE_DIR=$HOME/Library/Caches/orca-node-runtime" >>"$GITHUB_ENV"
+
+      - name: Cache the pinned Node runtime
+        uses: actions/cache@v5
+        with:
+          path: ~/Library/Caches/orca-node-runtime
+          key: orca-node-runtime-mac-${{ hashFiles('src/shared/node-runtime/node-runtime-pin.ts') }}
+
+      - name: Cache electron-builder downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: electron-builder-mac-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install dependencies
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: pnpm install --frozen-lockfile
+
+      - uses: ./.github/actions/install-mobile-dependencies
+
+      - name: Check the patched sources
+        run: |
+          set -euo pipefail
+          pnpm run typecheck
+          pnpm exec vitest run "$PINNED_TEST"
+
+      - name: Rename the app
+        env:
+          ORCA_PLUS_MAC_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: node plus/rebrand.mjs
+
+      - name: Verify macOS entitlements
+        run: pnpm verify:macos-entitlements
+
+      - name: Build app
+        run: pnpm run build:release
+
+      - name: Package, sign and notarize
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 60
+          max_attempts: 2
+          retry_wait_seconds: 30
+          command: >-
+            node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON config/scripts/orcad-distribution/prebuilds/pinned-node-downloads.mjs darwin-arm64
+            && node config/scripts/native-build/node-addons/ensure-native-runtime.mjs --runtime=electron
+            && rm -rf dist
+            && ORCA_MAC_RELEASE=1 pnpm exec electron-builder --config plus/electron-builder.plus.cjs --mac --arm64 --publish never
+        env:
+          CSC_LINK: ${{ secrets.MAC_CERTS }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Gate the update manifest on the minimum macOS
+        run: node config/scripts/desktop-distribution/macos/gate-mac-update-manifests.mjs dist
+
+      - name: Verify the signed app
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          app='dist/mac-arm64/Orca Plus.app'
+          codesign --verify --deep --strict "$app"
+          details="$(codesign -dv "$app" 2>&1)"
+          grep -q '^Identifier=com.nasonovcoder.orcaplus$' <<<"$details"
+          grep -q "^TeamIdentifier=$APPLE_TEAM_ID$" <<<"$details"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute -vv "$app"
+          test "v$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$TAG"
+          ! grep -R -a -q 'github.com/stablyai/orca/releases/latest/download' "$app/Contents/Resources/app.asar"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLUS_SHA: ${{ needs.patch.outputs.ref }}
+        run: |
+          set -euo pipefail
+          assets=(dist/orca-plus-arm64.dmg dist/orca-plus-arm64.zip dist/*.blockmap dist/latest-mac.yml)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$PLUS_SHA" --latest \
+              --title "Orca Plus ${TAG#v}" \
+              --notes "Orca $TAG from $UPSTREAM_REPO with the Orca Plus patch. Apple silicon only."
+          fi

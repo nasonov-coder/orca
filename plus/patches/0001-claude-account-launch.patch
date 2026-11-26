@@ -1,0 +1,284 @@
+diff --git a/src/main/claude-accounts/profiles/routing/claude-profile-installed-router.ts b/src/main/claude-accounts/profiles/routing/claude-profile-installed-router.ts
+index 27dd4db9c9..27fdd28c19 100644
+--- a/src/main/claude-accounts/profiles/routing/claude-profile-installed-router.ts
++++ b/src/main/claude-accounts/profiles/routing/claude-profile-installed-router.ts
+@@ -1,4 +1,5 @@
+ import { join } from 'node:path'
++import { CLAUDE_PINNED_ACCOUNT_ENV } from '../../../../shared/agent-accounts/claude/claude-profile-routing'
+ import { isDirectory } from '../claude-profile-homes'
+ // Keep the router setup graph out of scan workers.
+ import type { ClaudeProfileRouter } from './claude-profile-router'
+@@ -41,7 +42,7 @@ export function withClaudeProfileTerminalEnv<Env extends Record<string, string>
+   env: Env,
+   target: ClaudeAccountSelectionTarget
+ ): Env | Record<string, string> {
+-  const profileEnv = installed?.terminalEnv(target)
++  const profileEnv = installed?.terminalEnv(target, env?.[CLAUDE_PINNED_ACCOUNT_ENV])
+   return profileEnv ? { ...env, ...profileEnv } : env
+ }
+ 
+diff --git a/src/main/claude-accounts/profiles/routing/claude-profile-router-pinned.test.ts b/src/main/claude-accounts/profiles/routing/claude-profile-router-pinned.test.ts
+new file mode 100644
+index 0000000000..f01d2f39f8
+--- /dev/null
++++ b/src/main/claude-accounts/profiles/routing/claude-profile-router-pinned.test.ts
+@@ -0,0 +1,65 @@
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { ClaudeProfileRouter, type ClaudeProfileRouterSettings } from './claude-profile-router'
++import type { ClaudeManagedAccount } from '../../../../shared/agent-accounts/managed-account-types'
++
++const account = (id: string): ClaudeManagedAccount => ({
++  id,
++  email: `${id}@example.test`,
++  managedAuthPath: '',
++  authMethod: 'subscription-oauth',
++  createdAt: 0,
++  updatedAt: 0,
++  lastAuthenticatedAt: 0
++})
++
++describe('ClaudeProfileRouter pinned terminal account', () => {
++  let dataRoot: string
++
++  beforeEach(() => {
++    dataRoot = mkdtempSync(join(tmpdir(), 'orca-plus-pinned-'))
++  })
++
++  afterEach(() => {
++    rmSync(dataRoot, { recursive: true, force: true })
++  })
++
++  const router = (settings: Partial<ClaudeProfileRouterSettings>) =>
++    new ClaudeProfileRouter({
++      dataRoot,
++      userHome: dataRoot,
++      env: {},
++      runSetup: async () => ({ outcome: 'refused', warnings: [] }) as never,
++      getSettings: () => ({
++        claudeManagedAccounts: [account('personal'), account('other')],
++        activeClaudeManagedAccountId: null,
++        activeClaudeManagedAccountIdsByRuntime: { host: null, wsl: {} },
++        agentStatusHooksEnabled: false,
++        disabledTuiAgents: [],
++        ...settings
++      })
++    })
++
++  it('gives a pinned pane the account folder without the injected marker', () => {
++    const env = router({}).terminalEnv({ runtime: 'host' }, 'personal')
++    expect(env).toEqual({
++      ORCA_CLAUDE_PROFILE_POINTER: join(dataRoot, 'claude-profiles', 'selected-host'),
++      CLAUDE_CONFIG_DIR: join(dataRoot, 'claude-profiles', 'personal', 'home')
++    })
++  })
++
++  it('keeps the pin when another account is selected', () => {
++    const env = router({
++      activeClaudeManagedAccountIdsByRuntime: { host: 'other', wsl: {} }
++    }).terminalEnv({ runtime: 'host' }, 'personal')
++    expect(env.CLAUDE_CONFIG_DIR).toBe(join(dataRoot, 'claude-profiles', 'personal', 'home'))
++    expect(env.ORCA_CLAUDE_INJECTED_CONFIG_DIR).toBeUndefined()
++  })
++
++  it('ignores a pin that names no saved account', () => {
++    const env = router({}).terminalEnv({ runtime: 'host' }, 'missing')
++    expect(env.CLAUDE_CONFIG_DIR).toBeUndefined()
++  })
++})
+diff --git a/src/main/claude-accounts/profiles/routing/claude-profile-router.ts b/src/main/claude-accounts/profiles/routing/claude-profile-router.ts
+index 6dc8763964..8477a1b6cf 100644
+--- a/src/main/claude-accounts/profiles/routing/claude-profile-router.ts
++++ b/src/main/claude-accounts/profiles/routing/claude-profile-router.ts
+@@ -269,11 +269,19 @@ export class ClaudeProfileRouter {
+   }
+ 
+   /** A broken account selection must not prevent opening a terminal. */
+-  terminalEnv(target?: ClaudeAccountSelectionTarget): ClaudeEnvPatch {
++  terminalEnv(target?: ClaudeAccountSelectionTarget, pinned?: string | null): ClaudeEnvPatch {
+     // Pass the pointer without waiting on the guest.
+     if (target?.runtime === 'wsl') {
+       return { [CLAUDE_PROFILE_POINTER_ENV]: `~/${wslClaudeProfilePointer(this.args.dataRoot)}` }
+     }
++    if (pinned && this.savedAccount(pinned)) {
++      // Orca Plus: without the injected marker the claude shell function keeps this folder.
++      void this.prepareAccount(pinned).catch(() => {})
++      return {
++        [CLAUDE_PROFILE_POINTER_ENV]: this.pointerPath,
++        CLAUDE_CONFIG_DIR: this.accountHome(pinned)
++      }
++    }
+     // Save the user's value so the shell function can restore it on System default.
+     const userConfigDir = readUserClaudeConfigDirAsSet(this.env)
+     const base: ClaudeEnvPatch = {
+diff --git a/src/renderer/src/components/agent/launch-menu/AgentMenuItems.tsx b/src/renderer/src/components/agent/launch-menu/AgentMenuItems.tsx
+index b09ec6033a..822607c07c 100644
+--- a/src/renderer/src/components/agent/launch-menu/AgentMenuItems.tsx
++++ b/src/renderer/src/components/agent/launch-menu/AgentMenuItems.tsx
+@@ -40,6 +40,7 @@ import { useUiLanguageRevision } from '@/i18n/use-ui-language-revision'
+ import { cn } from '@/lib/class-names'
+ import type { NewTabAgentMenuRow } from '../../../../../shared/agent-launch/picker/agent-launch-picker-rows'
+ import { useNewTabAgentMenuRows } from './use-new-tab-agent-menu-rows'
++import { useClaudeAccountLaunchChoices } from './claude-account-launch-choices'
+ import type { NewTabAgentMenuModel } from './new-tab-agent-menu-model'
+ import { useAgentDetectionTargetForWorktree } from '@/lib/agent-session/launch/inventory/useAgentDetectionTarget'
+ import {
+@@ -117,6 +118,9 @@ export function useTabAgentMenuLaunch({
+             }
+           : {}),
+         agent,
++        ...(row.kind === 'cli' && row.claudeAccountId
++          ? { claudeAccountId: row.claudeAccountId }
++          : {}),
+         ...(draft
+           ? agentPickerFreshLaunchInputs(
+               draft,
+@@ -215,6 +219,7 @@ export function ProjectedAgentMenuItems({
+   const desktopDefaultAgent = useAppStateValue((s) => s.settings?.defaultTuiAgent)
+   const newAgentShortcut = useOptionalShortcutLabel('tab.newAgent')
+   const shortcutLabels = useAgentMenuShortcutLabels(pickerInventory ? model : undefined)
++  const claudeAccountChoices = useClaudeAccountLaunchChoices(model, runLaunch)
+   if (model.state === 'loading') {
+     // Why: rows fill in once when every answer is known, instead of reshuffling under the pointer.
+     return (
+@@ -272,6 +277,7 @@ export function ProjectedAgentMenuItems({
+           runLaunch={runLaunch}
+           onSelectAgent={onSelectPickerAgent}
+           hideSearch={hidePickerSearch}
++          choices={claudeAccountChoices}
+         />
+       ) : (
+         rows.map((row, index) => {
+@@ -343,6 +349,19 @@ export function ProjectedAgentMenuItems({
+           )
+         })
+       )}
++      {pickerInventory
++        ? null
++        : claudeAccountChoices.map((choice) => (
++            <DropdownMenuItem
++              key={choice.id}
++              variant="launch"
++              disabled={disabled}
++              onSelect={choice.onSelect}
++            >
++              {choice.icon}
++              <span className="min-w-0 flex-1 truncate">{choice.label}</span>
++            </DropdownMenuItem>
++          ))}
+       <OpenAgentSettingsMenuItem />
+     </>
+   )
+diff --git a/src/renderer/src/components/agent/launch-menu/claude-account-launch-choices.tsx b/src/renderer/src/components/agent/launch-menu/claude-account-launch-choices.tsx
+new file mode 100644
+index 0000000000..d790b36584
+--- /dev/null
++++ b/src/renderer/src/components/agent/launch-menu/claude-account-launch-choices.tsx
+@@ -0,0 +1,40 @@
++import { useMemo } from 'react'
++import { useAppStateValue } from '@/store/retained-views/app-state-view'
++import { AgentIcon } from '@/components/agent/icons/AgentIcon'
++import type { AgentPickerChoice } from '../agent-picker-search-rows'
++import type { AgentPickerMenuLaunch } from '../AgentLaunchPickerMenuRow'
++import type { NewTabAgentMenuModel } from './new-tab-agent-menu-model'
++
++/** Orca Plus: one terminal launch per saved Claude account other than the selected one. */
++export function useClaudeAccountLaunchChoices(
++  model: NewTabAgentMenuModel,
++  runLaunch: AgentPickerMenuLaunch
++): AgentPickerChoice[] {
++  const accounts = useAppStateValue((state) => state.settings?.claudeManagedAccounts)
++  const selectedId = useAppStateValue(
++    (state) =>
++      state.settings?.activeClaudeManagedAccountIdsByRuntime?.host ??
++      state.settings?.activeClaudeManagedAccountId ??
++      null
++  )
++  const claudeRunsHere =
++    model.state === 'settled' &&
++    (model.detection.detectedIds?.includes('claude') ?? false) &&
++    model.rows.some((row) => row.agent === 'claude' && (row.executionHostId ?? 'local') === 'local')
++  return useMemo(
++    () =>
++      claudeRunsHere
++        ? (accounts ?? [])
++            .filter((account) => account.id !== selectedId && account.managedAuthRuntime !== 'wsl')
++            .map((account) => ({
++              id: `claude-account:${account.id}`,
++              label: `Claude · ${account.email}`,
++              icon: <AgentIcon agent="claude" size={14} />,
++              onSelect: () => {
++                void runLaunch({ kind: 'cli', agent: 'claude', claudeAccountId: account.id })
++              }
++            }))
++        : [],
++    [accounts, claudeRunsHere, runLaunch, selectedId]
++  )
++}
+diff --git a/src/renderer/src/lib/agent-session/launch/new-tab/launch-agent-in-new-tab-args.ts b/src/renderer/src/lib/agent-session/launch/new-tab/launch-agent-in-new-tab-args.ts
+index 6e045998ad..cf7c8f43f0 100644
+--- a/src/renderer/src/lib/agent-session/launch/new-tab/launch-agent-in-new-tab-args.ts
++++ b/src/renderer/src/lib/agent-session/launch/new-tab/launch-agent-in-new-tab-args.ts
+@@ -22,6 +22,8 @@ export type LaunchAgentInNewTabArgs = LaunchAgentInNewTabRequest & {
+   prompt?: string
+   /** A surface the user already sees for this launch presents a preparation refusal, not a toast. */
+   presentsRefusal?: true
++  /** Orca Plus: the saved Claude account this terminal runs on instead of the selected one. */
++  claudeAccountId?: string
+   /** Optional CLI arguments appended to the selected agent command; a chat has no command line. */
+   agentArgs?: string | null
+   /** Raw action Arguments replace configured Arguments while inheriting host permission. */
+diff --git a/src/renderer/src/lib/agent-session/launch/new-tab/launch-agent-in-new-tab.ts b/src/renderer/src/lib/agent-session/launch/new-tab/launch-agent-in-new-tab.ts
+index ad76cb6d74..5b1867c83f 100644
+--- a/src/renderer/src/lib/agent-session/launch/new-tab/launch-agent-in-new-tab.ts
++++ b/src/renderer/src/lib/agent-session/launch/new-tab/launch-agent-in-new-tab.ts
+@@ -1,3 +1,4 @@
++import { CLAUDE_PINNED_ACCOUNT_ENV } from '../../../../../../shared/agent-accounts/claude/claude-profile-routing'
+ import { refuseAgentTabLaunch, refuseUnavailableAgentTabLaunch } from './launch-agent-tab-refusal'
+ import {
+   launchNewTabPromptThroughHost,
+@@ -257,7 +258,14 @@ function openAgentInNewTab(
+     pendingStartup: {
+       ...(trustWorktreeId ? { trustWorktreeId } : {}),
+       command: startupPlan.launchCommand,
+-      ...(startupPlan.env ? { env: startupPlan.env } : {}),
++      ...(startupPlan.env || args.claudeAccountId
++        ? {
++            env: {
++              ...startupPlan.env,
++              ...(args.claudeAccountId ? { [CLAUDE_PINNED_ACCOUNT_ENV]: args.claudeAccountId } : {})
++            }
++          }
++        : {}),
+       launchConfig: startupPlan.launchConfig,
+       launchAgent: agent,
+       ...(agentArgs !== undefined ? { agentArgsOverride: agentArgs } : {}),
+diff --git a/src/shared/agent-accounts/claude/claude-profile-routing.ts b/src/shared/agent-accounts/claude/claude-profile-routing.ts
+index 6b1294f236..b7f91b96da 100644
+--- a/src/shared/agent-accounts/claude/claude-profile-routing.ts
++++ b/src/shared/agent-accounts/claude/claude-profile-routing.ts
+@@ -7,6 +7,9 @@ export const CLAUDE_INJECTED_CONFIG_DIR_ENV = 'ORCA_CLAUDE_INJECTED_CONFIG_DIR'
+ /** The user's own CLAUDE_CONFIG_DIR an injected value replaced; System default restores it. */
+ export const CLAUDE_USER_CONFIG_DIR_ENV = 'ORCA_CLAUDE_USER_CONFIG_DIR'
+ 
++/** Orca Plus: a pane launched on one saved account, whatever the selected account is. */
++export const CLAUDE_PINNED_ACCOUNT_ENV = 'ORCA_CLAUDE_PINNED_ACCOUNT'
++
+ export const CLAUDE_PROFILE_MISSING_MESSAGE =
+   "The selected Claude account's folder is missing. Sign in to it again or choose another account."
+ 
+diff --git a/src/shared/agent-launch/picker/agent-launch-picker-rows.ts b/src/shared/agent-launch/picker/agent-launch-picker-rows.ts
+index fa97ea313d..2fb6c93039 100644
+--- a/src/shared/agent-launch/picker/agent-launch-picker-rows.ts
++++ b/src/shared/agent-launch/picker/agent-launch-picker-rows.ts
+@@ -54,7 +54,7 @@ export type NewTabAgentMenuRow =
+   (
+     | { kind: 'chat'; agent: TuiAgent; setup?: true }
+     | { kind: 'chat-unavailable'; agent: TuiAgent; reason: ChatUnavailableReason }
+-    | { kind: 'cli'; agent: TuiAgent; chat?: true }
++    | { kind: 'cli'; agent: TuiAgent; chat?: true; claudeAccountId?: string }
+     | { kind: 'terminal'; agent: TuiAgent }
+   ) & { executionHostId?: ExecutionHostId }
+ 
